@@ -39,8 +39,10 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		return nil
 	}
 
+	// Canonical model for capability gating only; wire model (openaiReq.Model) is untouched.
 	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
-	caps := schemas.ResolveModelCaps(schemas.ResolveBaseProvider(ctx, bifrostReq.Provider), capModel)
+	// The request's own row wins; base-family rows are only a fallback.
+	caps := schemas.ResolveModelCapsForRequest(ctx, bifrostReq.Provider, capModel)
 
 	openaiReq := &OpenAIChatRequest{
 		Model:    bifrostReq.Model,
@@ -62,7 +64,7 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 
 	if bifrostReq.Params != nil {
 		openaiReq.ChatParameters = *bifrostReq.Params
-		openaiReq.ServiceTier = serviceTierForModel(caps, openaiReq.ServiceTier)
+		openaiReq.ServiceTier = serviceTierForModel(ctx, bifrostReq.Provider, caps, openaiReq.ServiceTier)
 		if openaiReq.ChatParameters.MaxCompletionTokens != nil && *openaiReq.ChatParameters.MaxCompletionTokens < MinMaxCompletionTokens {
 			openaiReq.ChatParameters.MaxCompletionTokens = schemas.Ptr(MinMaxCompletionTokens)
 		}
@@ -267,6 +269,11 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 	default:
 		// Check if provider is a custom provider
 		if isCustomProvider, ok := ctx.Value(schemas.BifrostContextKeyIsCustomProvider).(bool); ok && isCustomProvider {
+			// This branch returns before the generic filter, so renames must run here too.
+			openaiReq.normalizeReasoningEffort(caps)
+			// The sampling restriction is conditional on the effort, so evaluate it
+			// after the renames normalized it.
+			openaiReq.stripUnsupportedSamplingParams(caps)
 			// A custom provider reports its own name, so a DeepSeek-based one lands here
 			// and still needs the json_schema downgrade DeepSeek's endpoint requires.
 			if schemas.ResolveBaseProvider(ctx, bifrostReq.Provider) == schemas.DeepSeek {
@@ -275,6 +282,7 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 			return openaiReq
 		}
 		openaiReq.filterOpenAISpecificParameters(caps)
+		openaiReq.stripUnsupportedSamplingParams(caps)
 		return openaiReq
 	}
 }
@@ -282,12 +290,14 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 // serviceTierForModel filters a requested tier against the final target model's
 // capabilities. Omitting an unsupported tier lets the provider use its default
 // instead of returning an unsupported-tier error.
-func serviceTierForModel(caps schemas.ModelCaps, tier *schemas.BifrostServiceTier) *schemas.BifrostServiceTier {
+func serviceTierForModel(ctx *schemas.BifrostContext, provider schemas.ModelProvider, caps schemas.ModelCaps, tier *schemas.BifrostServiceTier) *schemas.BifrostServiceTier {
 	if tier == nil {
 		return nil
 	}
 	fallback := true
-	if caps.Provider() == schemas.Bedrock || caps.Provider() == schemas.BedrockMantle {
+	// The guard is provider-family logic: a custom provider's own row reports the
+	// custom name, so resolve the base provider for the Bedrock check.
+	if base := schemas.ResolveBaseProvider(ctx, provider); base == schemas.Bedrock || base == schemas.BedrockMantle {
 		// Bedrock defaults to Standard when the field is omitted. Non-standard
 		// tiers are model-specific, so unknown catalog state must fail closed.
 		if *tier == schemas.BifrostServiceTierDefault || *tier == schemas.BifrostServiceTierAuto {
@@ -333,6 +343,7 @@ func (req *OpenAIChatRequest) normalizeReasoningEffort(caps schemas.ModelCaps) {
 	if req.ChatParameters.Reasoning != nil {
 		reasoningCopy := *req.ChatParameters.Reasoning
 		req.ChatParameters.Reasoning = &reasoningCopy
+		req.effortNormalized = true
 		if req.ChatParameters.Reasoning.Effort != nil {
 			// Native field is provided, use it (and clear max_tokens)
 			effort := *req.ChatParameters.Reasoning.Effort
@@ -347,7 +358,7 @@ func (req *OpenAIChatRequest) normalizeReasoningEffort(caps schemas.ModelCaps) {
 				maxCompletionTokens = *req.ChatParameters.MaxCompletionTokens
 			}
 			effort := utils.GetReasoningEffortFromBudgetTokens(maxTokens, MinReasoningMaxTokens, maxCompletionTokens)
-			req.ChatParameters.Reasoning.Effort = schemas.Ptr(effort)
+			req.ChatParameters.Reasoning.Effort = schemas.Ptr(normalizeReasoningEffort(req.Provider, caps, effort))
 			// Clear max_tokens since OpenAI doesn't use it
 			req.ChatParameters.Reasoning.MaxTokens = nil
 		}
@@ -401,7 +412,14 @@ func (req *OpenAIChatRequest) applyMistralCompatibility(caps schemas.ModelCaps) 
 	}
 
 	if req.Reasoning != nil && req.Reasoning.Effort != nil {
-		req.Reasoning.Effort = schemas.Ptr(caps.NormalizeReasoningEffort(*req.Reasoning.Effort, mistralLegacyEffortControl))
+		// The generic filter already applied the row's rename table on the
+		// request path; clamping again (row ladder or the legacy none/high
+		// fallback) without renaming keeps chained tables from double-applying.
+		if req.effortNormalized {
+			req.Reasoning.Effort = schemas.Ptr(caps.ClampReasoningEffort(*req.Reasoning.Effort, mistralLegacyEffortControl))
+		} else {
+			req.Reasoning.Effort = schemas.Ptr(caps.NormalizeReasoningEffort(*req.Reasoning.Effort, mistralLegacyEffortControl))
+		}
 	}
 
 	// Mistral rejects unknown assistant fields with 422 extra_forbidden, reasoning_content included

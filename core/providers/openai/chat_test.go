@@ -725,6 +725,39 @@ func TestToOpenAIChatRequest_MistralReasoningEffortFollowsDatasheet(t *testing.T
 	}
 }
 
+// TestToOpenAIChatRequest_MistralRenameAppliesOnce pins that the Mistral compat
+// pass does not re-apply the datasheet rename table to a value the generic filter
+// already renamed: a chained table (high→medium, medium→low) must land on
+// medium, not run the chain twice. The legacy none/high clamp still applies to
+// requests the first pass left unrenamed.
+func TestToOpenAIChatRequest_MistralRenameAppliesOnce(t *testing.T) {
+	schemas.SetCapabilityResolver(func(p schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+		if p == schemas.Mistral && m == "chain-medium-latest" {
+			return &schemas.ModelCapabilities{
+				ReasoningEffortLevels:  []string{"low", "medium", "high"},
+				ReasoningEffortRenames: map[string]string{"high": "medium", "medium": "low"},
+			}
+		}
+		return nil
+	})
+	t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+
+	req := &schemas.BifrostChatRequest{
+		Provider: schemas.Mistral,
+		Model:    "chain-medium-latest",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+		}},
+		Params: &schemas.ChatParameters{Reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}},
+	}
+	out := ToOpenAIChatRequest(schemas.NewBifrostContext(nil, schemas.NoDeadline), req)
+	require.NotNil(t, out)
+	require.NotNil(t, out.Reasoning)
+	require.Equal(t, "medium", *out.Reasoning.Effort)
+	require.Equal(t, "high", *req.Params.Reasoning.Effort)
+}
+
 // TestToOpenAIChatRequest_StripsUnsupportedSamplingParams pins that sampling fields
 // OpenAI rejects at the effective reasoning effort are dropped for OpenAI and Azure.
 func TestToOpenAIChatRequest_StripsUnsupportedSamplingParams(t *testing.T) {
@@ -3740,4 +3773,280 @@ func TestOpenAIChatRequest_MessageLevelCacheControlIngress(t *testing.T) {
 	body, err := sonic.Marshal(ToOpenAIChatRequest(ctx, bifrostReq))
 	require.NoError(t, err)
 	require.Equal(t, 3, strings.Count(string(body), `"cache_control"`), "all three breakpoints must reach OpenRouter: %s", body)
+}
+
+// customProviderContext reproduces what bifrost stamps on every request routed
+// to a custom provider: the wire provider key plus the built-in base type.
+func customProviderContext(base schemas.ModelProvider) *schemas.BifrostContext {
+	return schemas.NewBifrostContextWithValue(context.Background(), schemas.NoDeadline, schemas.BifrostContextKeyBaseProviderType, base)
+}
+
+// customProviderEarlyReturnContext reproduces the other custom shape: no base
+// type, so bifrost marks BifrostContextKeyIsCustomProvider true.
+func customProviderEarlyReturnContext() *schemas.BifrostContext {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+	return ctx
+}
+
+// TestToOpenAIChatRequest_CustomProviderEffortRenamesFollowDatasheet pins that
+// reasoning_effort_renames rows keyed by a custom provider's own name apply to
+// its chat requests: CommandCode accepts off|low|medium|high|xhigh|max and
+// 400s on "none"; OpenCode-Go accepts none and 400s on "off".
+func TestToOpenAIChatRequest_CustomProviderEffortRenamesFollowDatasheet(t *testing.T) {
+	commandCodeRow := &schemas.ModelCapabilities{
+		ReasoningEffortLevels:  []string{"off", "low", "medium", "high", "xhigh", "max"},
+		ReasoningEffortRenames: map[string]string{"none": "off"},
+	}
+	opencodeGoRow := &schemas.ModelCapabilities{
+		ReasoningEffortLevels:  []string{"none", "low", "medium", "high"},
+		ReasoningEffortRenames: map[string]string{"off": "none"},
+		// OpenCode-Go's dialect treats "none" as reasoning-disabled and accepts it.
+		SupportsReasoningDisable: schemas.Ptr(true),
+	}
+	schemas.SetCapabilityResolver(func(p schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+		switch {
+		case p == "commandcode" && m == "deepseek-v4.1-flash":
+			return commandCodeRow
+		case p == "opencode-go" && m == "deepseek-v4.1-flash":
+			return opencodeGoRow
+		}
+		return nil
+	})
+	t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+
+	tests := []struct {
+		name     string
+		provider schemas.ModelProvider
+		effort   string
+		expected string
+	}{
+		{name: "commandcode renames none to off", provider: "commandcode", effort: "none", expected: "off"},
+		{name: "commandcode keeps a native level", provider: "commandcode", effort: "high", expected: "high"},
+		{name: "opencode-go renames off to none", provider: "opencode-go", effort: "off", expected: "none"},
+		{name: "opencode-go keeps a native level", provider: "opencode-go", effort: "low", expected: "low"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "deepseek-v4.1-flash",
+				Input: []schemas.ChatMessage{{
+					Role:    schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+				}},
+				Params: &schemas.ChatParameters{Reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr(tt.effort)}},
+			}
+			out := ToOpenAIChatRequest(customProviderContext(schemas.OpenAI), req)
+			require.NotNil(t, out)
+			require.NotNil(t, out.Reasoning)
+			require.NotNil(t, out.Reasoning.Effort)
+			require.Equal(t, tt.expected, *out.Reasoning.Effort)
+			// The caller's request is reused for fallbacks, so the rename must
+			// not write through to it.
+			require.Equal(t, tt.effort, *req.Params.Reasoning.Effort)
+		})
+	}
+}
+
+// TestToOpenAIChatRequest_CustomProviderEarlyReturnAppliesEffortRenames pins
+// that the custom-provider early-return branch still applies effort renames,
+// matching the Responses converter.
+func TestToOpenAIChatRequest_CustomProviderEarlyReturnAppliesEffortRenames(t *testing.T) {
+	commandCodeRow := &schemas.ModelCapabilities{
+		ReasoningEffortLevels:  []string{"off", "low", "medium", "high", "xhigh", "max"},
+		ReasoningEffortRenames: map[string]string{"none": "off"},
+	}
+	schemas.SetCapabilityResolver(func(p schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+		if p == "commandcode" && m == "deepseek-v4.1-flash" {
+			return commandCodeRow
+		}
+		return nil
+	})
+	t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+
+	req := &schemas.BifrostChatRequest{
+		Provider: "commandcode",
+		Model:    "deepseek-v4.1-flash",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+		}},
+		Params: &schemas.ChatParameters{Reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("none")}},
+	}
+	out := ToOpenAIChatRequest(customProviderEarlyReturnContext(), req)
+	require.NotNil(t, out)
+	require.NotNil(t, out.Reasoning)
+	require.NotNil(t, out.Reasoning.Effort)
+	require.Equal(t, "off", *out.Reasoning.Effort)
+	require.Equal(t, "none", *req.Params.Reasoning.Effort)
+}
+
+// TestToOpenAIChatRequest_CustomProviderSamplingRestrictionFollowsRow pins that
+// the custom-provider early return evaluates the conditional sampling strip
+// against the normalized effort: an enabled (budget-derived) effort drops
+// temperature, a disabled one keeps it.
+func TestToOpenAIChatRequest_CustomProviderSamplingRestrictionFollowsRow(t *testing.T) {
+	schemas.SetCapabilityResolver(func(p schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+		if p == "commandcode" && m == "deepseek-v4.1-flash" {
+			return &schemas.ModelCapabilities{
+				ConditionallyUnsupportedFields: map[string]string{
+					schemas.FieldTemperature: schemas.ConditionWhenEffortNone,
+				},
+			}
+		}
+		return nil
+	})
+	t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+
+	newReq := func(reasoning *schemas.ChatReasoning) *schemas.BifrostChatRequest {
+		return &schemas.BifrostChatRequest{
+			Provider: "commandcode",
+			Model:    "deepseek-v4.1-flash",
+			Input: []schemas.ChatMessage{{
+				Role:    schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+			}},
+			Params: &schemas.ChatParameters{
+				Reasoning:   reasoning,
+				Temperature: schemas.Ptr(0.5),
+			},
+		}
+	}
+
+	t.Run("budget-derived enabled effort drops temperature", func(t *testing.T) {
+		out := ToOpenAIChatRequest(customProviderEarlyReturnContext(), newReq(&schemas.ChatReasoning{MaxTokens: schemas.Ptr(20000)}))
+		require.NotNil(t, out)
+		require.NotNil(t, out.Reasoning)
+		require.NotNil(t, out.Reasoning.Effort)
+		require.Nil(t, out.Temperature, "reasoning is on, so the row's condition strips temperature")
+	})
+
+	t.Run("disabled effort keeps temperature", func(t *testing.T) {
+		out := ToOpenAIChatRequest(customProviderEarlyReturnContext(), newReq(&schemas.ChatReasoning{Effort: schemas.Ptr("none")}))
+		require.NotNil(t, out)
+		require.NotNil(t, out.Temperature, "reasoning is off, so the condition keeps temperature")
+	})
+
+	t.Run("base-typed custom ctx strips through the generic path", func(t *testing.T) {
+		ctx := customProviderContext(schemas.OpenAI)
+		out := ToOpenAIChatRequest(ctx, newReq(&schemas.ChatReasoning{MaxTokens: schemas.Ptr(20000)}))
+		require.NotNil(t, out)
+		require.NotNil(t, out.Reasoning)
+		require.NotNil(t, out.Reasoning.Effort)
+		require.Nil(t, out.Temperature, "reasoning is on, so the row's condition strips temperature on the generic path too")
+	})
+}
+
+// TestToOpenAIChatRequest_CustomProviderBudgetEffortFollowsDatasheet pins that
+// an effort estimated from a reasoning token budget is normalized against the
+// row too — the custom early-return path never reaches the generic filter.
+func TestToOpenAIChatRequest_CustomProviderBudgetEffortFollowsDatasheet(t *testing.T) {
+	commandCodeRow := &schemas.ModelCapabilities{
+		ReasoningEffortLevels:  []string{"off", "low", "medium", "xhigh", "max"},
+		ReasoningEffortRenames: map[string]string{"high": "off"},
+	}
+	schemas.SetCapabilityResolver(func(p schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+		if p == "commandcode" && m == "deepseek-v4.1-flash" {
+			return commandCodeRow
+		}
+		return nil
+	})
+	t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+
+	req := &schemas.BifrostChatRequest{
+		Provider: "commandcode",
+		Model:    "deepseek-v4.1-flash",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+		}},
+		Params: &schemas.ChatParameters{
+			Reasoning:           &schemas.ChatReasoning{MaxTokens: schemas.Ptr(20000)},
+			MaxCompletionTokens: schemas.Ptr(10000),
+		},
+	}
+	out := ToOpenAIChatRequest(customProviderEarlyReturnContext(), req)
+	require.NotNil(t, out)
+	require.NotNil(t, out.Reasoning)
+	require.NotNil(t, out.Reasoning.Effort)
+	require.Equal(t, "off", *out.Reasoning.Effort)
+}
+
+// TestToOpenAIChatRequest_CustomProviderInheritsBaseProviderRows pins that a
+// custom provider with no row of its own still inherits the base family's.
+func TestToOpenAIChatRequest_CustomProviderInheritsBaseProviderRows(t *testing.T) {
+	baseRow := &schemas.ModelCapabilities{SupportsDeveloperRole: schemas.Ptr(false)}
+	schemas.SetCapabilityResolver(func(p schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+		if p == schemas.OpenAI && m == "gpt-5.1" {
+			return baseRow
+		}
+		return nil
+	})
+	t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+
+	req := &schemas.BifrostChatRequest{
+		Provider: "acme",
+		Model:    "gpt-5.1",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleDeveloper,
+			Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("stay in character")},
+		}},
+	}
+	out := ToOpenAIChatRequest(customProviderContext(schemas.OpenAI), req)
+	require.NotNil(t, out)
+	require.Equal(t, schemas.ChatMessageRoleSystem, out.Messages[0].Role)
+}
+
+// TestToOpenAIChatRequest_MistralPreservesRenamedEffortWithoutLevels pins the
+// follow-up to the rename-once fix: a Mistral row that only renames (no
+// published levels) must keep its own label through the compat pass — clamping
+// the renamed value onto the legacy none/high ladder would send the wrong
+// label. Covers the native and the budget-derived entry points.
+func TestToOpenAIChatRequest_MistralPreservesRenamedEffortWithoutLevels(t *testing.T) {
+	schemas.SetCapabilityResolver(func(p schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+		if p == schemas.Mistral && m == "renames-only-latest" {
+			return &schemas.ModelCapabilities{ReasoningEffortRenames: map[string]string{"high": "medium"}}
+		}
+		return nil
+	})
+	t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+
+	ctx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+
+	t.Run("native effort", func(t *testing.T) {
+		req := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "renames-only-latest",
+			Input: []schemas.ChatMessage{{
+				Role:    schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+			}},
+			Params: &schemas.ChatParameters{Reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}},
+		}
+		out := ToOpenAIChatRequest(ctx, req)
+		require.NotNil(t, out)
+		require.NotNil(t, out.Reasoning)
+		require.Equal(t, "medium", *out.Reasoning.Effort)
+	})
+
+	t.Run("budget-derived effort", func(t *testing.T) {
+		req := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "renames-only-latest",
+			Input: []schemas.ChatMessage{{
+				Role:    schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+			}},
+			Params: &schemas.ChatParameters{
+				Reasoning:           &schemas.ChatReasoning{MaxTokens: schemas.Ptr(20000)},
+				MaxCompletionTokens: schemas.Ptr(10000),
+			},
+		}
+		out := ToOpenAIChatRequest(ctx, req)
+		require.NotNil(t, out)
+		require.NotNil(t, out.Reasoning)
+		require.NotNil(t, out.Reasoning.Effort)
+		require.Equal(t, "medium", *out.Reasoning.Effort)
+	})
 }

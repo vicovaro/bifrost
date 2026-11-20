@@ -151,7 +151,19 @@ func defaultReasoningEffort(model string) string {
 // the name-based default.
 func omittedEffortReasons(caps schemas.ModelCaps, model string) bool {
 	effort := caps.DefaultReasoningEffort(defaultReasoningEffort(model))
-	return effort != "" && effort != schemas.ReasoningEffortNone
+	if effort == "" || effort == schemas.ReasoningEffortNone {
+		return false
+	}
+	// A row can spell its disabled default in its own dialect (none → off);
+	// omitted effort then agrees with an explicit disabled label. Only on a
+	// model that can disable reasoning — an always-reasoning row maps "none"
+	// onto its lowest rung, which is not the disabled state.
+	if caps.CanDisableReasoning(defaultCanDisableReasoning(model)) {
+		if label, ok := caps.EffortLabelFor(schemas.ReasoningEffortNone); ok && label == effort {
+			return false
+		}
+	}
+	return true
 }
 
 // defaultEffortControl widens the base low/medium/high ladder with the effort
